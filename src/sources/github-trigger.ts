@@ -4,6 +4,22 @@ import { key, type ChannelRef, type Trigger } from '../core/index.ts'
 import { escapeRegExp, sameName } from '../infra/text.ts'
 
 export const SOURCE = 'github'
+/** Visible line the agent appends to every reply. The GitHub Source lets a team customize it. */
+export const DEFAULT_AGENT_SIGNATURE = 'by 大肥鱼'
+/** Hidden idempotency marker of every Channel reply; also a model-independent signal of agent authorship. */
+export const AGENT_MARKER_PREFIX = '<!-- dsh-superagent:'
+export const agentMarker = (id: string): string => `${AGENT_MARKER_PREFIX}${id} -->`
+/**
+ * Code-level discriminator between a human comment and a reply the agent posted, used when one GitHub account
+ * serves both. A reply carries the configured signature as a standalone line, or the hidden delivery marker.
+ * Conservative on purpose: a quoted agent comment is treated as the agent's, never as a new human request.
+ */
+export function isAgentAuthored(body: string | null | undefined, signature: string): boolean {
+  const text = body ?? ''
+  if (text.includes(AGENT_MARKER_PREFIX)) return true
+  const line = signature.trim()
+  return !!line && text.split(/\r?\n/).some(part => part.trim() === line)
+}
 /** GitHub reply address: issue/PR conversation, or a review thread when `url` points at a discussion comment. */
 export const githubChannel = (number: number, url?: string): ChannelRef =>
   ({ source: SOURCE, thread: `github:${number}`, address: { number: String(number), ...(url ? { url } : {}) } })

@@ -5,8 +5,8 @@ import { sameName } from '../infra/text.ts'
 import { GithubAccountsSchema } from '../deployment.ts'
 import { CliError, validItems, type Tally } from '../infra/commands.ts'
 import { ciCounts, ciFact, ciFailures, ciSummary, githubThreadContext, pullChecks } from './github-read.ts'
-import { branchCiTrigger, ciTrigger, commentTrigger, CommentSchema, githubAddress, issueTrigger, IssueSchema, pullTrigger, SOURCE }
-  from './github-trigger.ts'
+import { branchCiTrigger, ciTrigger, commentTrigger, CommentSchema, DEFAULT_AGENT_SIGNATURE, githubAddress, isAgentAuthored,
+  issueTrigger, IssueSchema, pullTrigger, SOURCE } from './github-trigger.ts'
 import { githubLink, sendGithub } from './github-channel.ts'
 import type { GithubComment, PullRef } from './github-trigger.ts'
 import { observePull, pullsOf, readPull, type Pull } from './github-pull.ts'
@@ -25,7 +25,12 @@ const NotificationSchema = z.looseObject({
 const GithubConfigSchema = GithubAccountsSchema.extend({ pollSeconds: z.number().int().min(60).max(3600).default(60),
   failuresBeforeError: z.number().int().min(1).max(20).default(3),
   observeIssues: z.boolean().default(false), observePulls: z.boolean().default(false), observeComments: z.boolean().default(false),
-  observeCi: z.boolean().default(false) }).strict()
+  observeCi: z.boolean().default(false),
+  /** A person and the agent use the same account: unsigned comments from it are human, signed ones are the agent's. */
+  sharedAccount: z.boolean().default(false),
+  /** Standalone line appended to every agent reply; the code uses it to tell human comments from AI replies. */
+  agentSignature: z.string().trim().min(1).max(100).regex(/^[^\r\n]+$/, 'one line').default(DEFAULT_AGENT_SIGNATURE),
+}).strict()
 export type GithubConfig = z.infer<typeof GithubConfigSchema>
 const OBSERVED = { issues: 'observeIssues', pulls: 'observePulls', comments: 'observeComments', ci: 'observeCi' } as const
 type Scope = keyof typeof OBSERVED
@@ -54,7 +59,11 @@ export const githubKind: SourceKind<GithubConfig> = {
     { key: 'observeComments', type: 'switch', label: { zh: '接收仓库里的评论', en: 'Receive comments in the repository' },
       hint: { zh: '打开后，Issue 和 PR 上没有 @ 智能体的评论和代码评论也会收到，由策略的接收表决定是否成为候选。', en: 'Comments and review comments on Issues and PRs that do not mention the agent are received too, and the Policy\'s admission table decides whether they become candidates.' } },
     { key: 'observeCi', type: 'switch', label: { zh: '接收默认分支的 CI', en: 'Receive the default branch\'s CI' },
-      hint: { zh: '打开后，默认分支的 CI 失败和恢复会收到，由策略的接收表决定是否成为候选。', en: 'Failures of the default branch\'s CI, and its recovery, are received, and the Policy\'s admission table decides whether they become candidates.' } }],
+      hint: { zh: '打开后，默认分支的 CI 失败和恢复会收到，由策略的接收表决定是否成为候选。', en: 'Failures of the default branch\'s CI, and its recovery, are received, and the Policy\'s admission table decides whether they become candidates.' } },
+    { key: 'sharedAccount', type: 'switch', label: { zh: '人类与智能体共用同一账号', en: 'Human and agent share one account' },
+      hint: { zh: '打开后，智能体账号发的、没有签名的评论按人类留言接收；带签名的评论一律视为智能体自己的回复并忽略，避免自我触发。操作者与智能体使用同一个 GitHub 账号时需要打开。', en: 'When on, unsigned comments from the agent account are received as human messages and signed comments are ignored as the agent own replies, preventing self-triggering. Turn on when the agent and operator use the same GitHub account.' } },
+    { key: 'agentSignature', type: 'text', label: { zh: '智能体评论签名', en: 'Agent comment signature' },
+      hint: { zh: '智能体每条回复末尾附加的独立一行；代码用它区分人类留言与 AI 留言。可自定义，例如「by 大肥鱼」。', en: 'A standalone line appended to every agent reply; the code uses it to tell human comments from AI replies. Customizable, for example "by Da Fei Yu".' } }],
   // What the Source observes across the repository it receives in full; elsewhere, only what addresses the agent.
   scope: ({ meta }, config) => {
     const row = scopeOf(meta)
@@ -96,11 +105,13 @@ export const githubKind: SourceKind<GithubConfig> = {
       { key: 'DSH_SUPERAGENT_GITHUB_COMMIT_EMAIL', description: { zh: '智能体账号的提交邮箱。这里的 git 没有身份：按提示词写明的作者提交，没有写明时用智能体账号和这个邮箱', en: 'Commit email of the agent\'s account. git has no identity here: commit as the author these instructions name, or as the agent\'s account with this email when they name none' } },
       { key: 'DSH_SUPERAGENT_GITHUB_NUMBER', description: { zh: '接下工单的 Issue 或 PR 编号；工单不是从 GitHub 来的时为空', en: 'Number of the Issue or PR that started the ticket; empty when the ticket did not start on GitHub' } },
       { key: 'DSH_SUPERAGENT_GITHUB_PR_HEAD', description: { zh: '接下工单的 PR 的 head 引用 refs/pull/<编号>/head；不是 PR 时为空', en: 'Head ref refs/pull/<number>/head of the PR that started the ticket; empty when it was not a PR' } },
+      { key: 'DSH_SUPERAGENT_GITHUB_SIGNATURE', description: { zh: '智能体评论签名；执行器直接用 gh 发评论时必须把它作为独立一行附在末尾，否则会被当成人类留言', en: 'Agent comment signature; a worker posting a comment directly with gh must append it as a standalone final line, or the comment is treated as a human message' } },
     ],
-    values: ({ deployment, trigger }) => {
+    values: ({ deployment, trigger, config }) => {
       const number = trigger?.threads[0]?.source === SOURCE ? Number(trigger.meta.number) || 0 : 0
       return { DSH_SUPERAGENT_GITHUB_REPOSITORY: deployment.repository, DSH_SUPERAGENT_GITHUB_ACCOUNT: deployment.github.login, DSH_SUPERAGENT_GITHUB_COMMIT_EMAIL: deployment.github.noreply, DSH_SUPERAGENT_GITHUB_NUMBER: number ? String(number) : '',
-        DSH_SUPERAGENT_GITHUB_PR_HEAD: number && trigger?.meta.isPr === true ? `refs/pull/${number}/head` : '' }
+        DSH_SUPERAGENT_GITHUB_PR_HEAD: number && trigger?.meta.isPr === true ? `refs/pull/${number}/head` : '',
+        DSH_SUPERAGENT_GITHUB_SIGNATURE: config.agentSignature }
     },
   },
   facts: (deployment): Record<string, Localized | string> => deployment ? {
@@ -224,8 +235,9 @@ async function readStream(ctx: SourceContext, round: Round, id: string, path: st
   for (const item of items) {
     // Stopping mid-stream aborts before advancing the cursor so unread items are retried.
     if (stopped(ctx, round)) throw new Error('The GitHub Source stopped during the poll')
-    if (sameName(item.user.login, login)) continue
     if (id === 'issues') {
+      // New Issues and PRs opened by the agent account are never triggers, even when a person shares that account.
+      if (sameName(item.user.login, login)) continue
       const issue = IssueSchema.safeParse(item)
       const pr = issue.success && !!issue.data.pull_request
       if (!issue.success || !fresh(issue.data.created_at, pr ? 'pulls' : 'issues')) continue
@@ -237,8 +249,7 @@ async function readStream(ctx: SourceContext, round: Round, id: string, path: st
     if (!number || !fresh(item.updated_at ?? item.created_at, 'comments')) continue
     const isPr = id === 'review-comments' || /\/pull\//.test(item.html_url ?? '')
     const ref = { number, isPr, ...item.html_url ? { url: item.html_url } : {} }
-    const trigger = commentTrigger(item, ref, id === 'comments' ? 'conversation' : 'inline', login)
-    if (trigger.text) await ctx.receive(trigger)
+    await receiveComment(ctx, item, ref, id === 'comments' ? 'conversation' : 'inline', config)
   }
   const newest = Math.max(...items.map(item => Date.parse(item.updated_at ?? '')).filter(Number.isFinite))
   const moved = Number.isFinite(newest) ? cursorAt(new Date(newest).toISOString()) : since
@@ -381,9 +392,27 @@ function pull(ctx: SourceContext, round: Round, number: number): Promise<Pull> {
   }
   return read
 }
+/**
+ * Ingests one comment. With a dedicated agent account, every message of that account is dropped as before.
+ * When one account is shared, the signature (or hidden marker) is the code-level discriminator: a signed reply is
+ * the agent's and never enters the domain; an unsigned comment from that account is the human's and becomes a
+ * human Trigger. This prevents the agent's own replies from starting or resuming work.
+ */
+async function receiveComment(ctx: SourceContext, comment: GithubComment, ref: PullRef,
+  kind: 'conversation' | 'inline' | 'review', config: GithubConfig): Promise<void> {
+  const { login } = ctx.deployment.github
+  const self = sameName(comment.user.login, login)
+  if (config.sharedAccount && isAgentAuthored(comment.body, config.agentSignature)) return
+  if (self && !config.sharedAccount) return
+  const trigger = commentTrigger(comment, ref, kind, login)
+  if (!trigger.text) return
+  // An unsigned comment from the shared account is a person's; commentTrigger marks the agent's own as automated.
+  await ctx.receive(self ? { ...trigger, human: true } : trigger)
+}
 async function intakeComments(ctx: SourceContext, ref: PullRef, since: string, round: Round): Promise<void> {
   const commands = ctx.commands.withSignal(round.signal)
-  const { login } = ctx.deployment.github
+  const config = ctx.config<GithubConfig>(SOURCE)
+  if (!config) return
   const kinds = ref.isPr ? ['conversation', 'inline', 'review'] as const : ['conversation'] as const
   for (const kind of kinds) {
     const suffix = `&since=${encodeURIComponent(since)}`
@@ -394,10 +423,8 @@ async function intakeComments(ctx: SourceContext, ref: PullRef, since: string, r
       if (stopped(ctx, round)) throw new Error('The GitHub Source stopped during the poll')
       const timestamp = Date.parse(comment.updated_at ?? comment.submitted_at ?? comment.created_at ?? '')
       if (!Number.isFinite(timestamp) || timestamp < Date.parse(since)) continue
-      if (sameName(comment.user.login, login)) continue
       // A review decision without a body still reaches the ticket: a worker may be waiting for that approval.
-      const trigger = commentTrigger(comment, ref, kind, login)
-      if (trigger.text) await ctx.receive(trigger)
+      await receiveComment(ctx, comment, ref, kind, config)
     }
   }
 }

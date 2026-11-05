@@ -5,7 +5,7 @@ import { backfillChat, consumerRetry, feishuKind, feishuTriggerId, feishuRef, fe
 import { KV } from '../src/kv.ts'
 import { apply as applyFeishu, pollThreads as pollFeishuThreads } from '../src/sources/feishu.ts'
 import { runFeishu } from '../src/sources/feishu-loops.ts'
-import { commentTrigger, githubAddress, githubChannel, issueTrigger, type GithubComment, type GithubIssue } from '../src/sources/github-trigger.ts'
+import { agentMarker, commentTrigger, githubAddress, githubChannel, isAgentAuthored, issueTrigger, type GithubComment, type GithubIssue } from '../src/sources/github-trigger.ts'
 import { claimPull, observePull, pullEndNotices, pullOf, ticketBranch, type Pull } from '../src/sources/github-pull.ts'
 import { ciCounts, ciFact, ciSummary } from '../src/sources/github-read.ts'
 import { apply as applyGithub, githubKind, pollFailure, pollRound } from '../src/sources/github.ts'
@@ -340,6 +340,17 @@ describe('github source', () => {
     expect(commentTrigger({ id: 9, body: '@Agent-Bot please fix', user: { login: 'alice', type: 'User' } }, { number: 7, isPr: true }, 'conversation', 'agent-bot')).toMatchObject({ human: true, addressed: 'mention' })
     expect(commentTrigger({ id: 10, body: 'mail@agent-bot.example', user: { login: 'alice', type: 'User' } }, { number: 7, isPr: true }, 'conversation', 'agent-bot')).not.toHaveProperty('addressed')
     expect(commentTrigger({ id: 11, body: 'pushed', user: { login: 'Agent-Bot', type: 'User' } }, { number: 7, isPr: true }, 'conversation', 'agent-bot').human).toBe(false)
+  })
+  it('classifies signed agent replies by code, never by a model guess', () => {
+    const signature = 'by 大肥鱼'
+    expect(isAgentAuthored('可以做', signature)).toBe(false)
+    expect(isAgentAuthored(`让 ${signature} 做`, signature)).toBe(false)
+    expect(isAgentAuthored('', signature)).toBe(false)
+    expect(isAgentAuthored(null, '')).toBe(false)
+    expect(isAgentAuthored(`Done\n\n${signature}\n\n${agentMarker('r1')}`, signature)).toBe(true)
+    // The hidden marker alone also identifies a reply, even if the signature was customized later.
+    expect(isAgentAuthored(`Done\n\n${agentMarker('r1')}`, 'by 小肥鱼')).toBe(true)
+    expect(isAgentAuthored(`Done\n\nby 小肥鱼`, 'by 小肥鱼')).toBe(true)
   })
   it('reads the address of an Issue, a PR or a review comment of the repository, and nothing else', () => {
     expect(githubAddress('https://api.github.com/repos/acme/widgets/pulls/9', 'acme/widgets')).toEqual({ number: 9, pr: true })
@@ -1024,7 +1035,7 @@ it('reports GitHub as failing only after the configured number of consecutive fa
   expect(pollFailure(2, 3, eof)).toBeUndefined()
   expect(pollFailure(3, 3, eof)).toEqual({ state: 'error', detail: '3 consecutive failed polls; last: Error: Get "https://api.github.com/x": EOF', code: 'pollFailures', values: { count: '3', error: 'Error: Get "https://api.github.com/x": EOF' } })
   expect(githubKind.schema.parse({})).toEqual({ repository: '', cli: '', pollSeconds: 60, failuresBeforeError: 3, observeIssues: false,
-    observePulls: false, observeComments: false, observeCi: false })
+    observePulls: false, observeComments: false, observeCi: false, sharedAccount: false, agentSignature: 'by 大肥鱼' })
 })
 describe('feishu event consumer', () => {
   let dir: string
@@ -1191,7 +1202,7 @@ describe('observing the GitHub repository', () => {
   const issue = (number: number, fields: Partial<GithubIssue> = {}): GithubIssue => ({ id: 1000 + number, number, title: `Issue ${number}`,
     body: 'details', state: 'open', created_at: at(0), updated_at: at(0),
     html_url: `https://github.com/acme/widgets/issues/${number}`, user: { login: 'carol', type: 'User' }, ...fields })
-  const observe = (h: ReturnType<typeof host>, config: Record<string, boolean>) =>
+  const observe = (h: ReturnType<typeof host>, config: Record<string, unknown>) =>
     h.store.saveSettings({ ...h.store.settings(), sources: { ...h.store.settings().sources, github: { enabled: true, config } } })
   /** GitHub as the repository's lists and its default branch answer; a request with the ETag of an unchanged list answers 304. */
   function repository(h: ReturnType<typeof host>, answers: { issues?: unknown[]; comments?: unknown[]; reviewComments?: unknown[];
@@ -1264,6 +1275,39 @@ describe('observing the GitHub repository', () => {
     await pollRound(h)
     expect(h.receive.mock.calls.map(([trigger]) => [trigger.meta.number, trigger.meta.isPr, trigger.meta.kind, trigger.human]))
       .toEqual([[7, false, 'conversation', true], [9, true, 'conversation', false], [9, true, 'inline', true]])
+    h.store.close()
+  })
+  it('receives unsigned comments from the agent account as human in shared-account mode and skips signed agent replies', async () => {
+    const h = host()
+    observe(h, { observeComments: true, sharedAccount: true, agentSignature: 'by 大肥鱼' })
+    h.store.set('github-since', at(-24))
+    for (const stream of ['comments', 'review-comments']) {
+      h.store.set(`github-stream:${stream}`, { since: at(0), started: { comments: at(0) } })
+    }
+    const comment = (id: number, body: string, user: string) => ({ id, body, user: { login: user, type: 'User' },
+      created_at: at(1), updated_at: at(1), issue_url: 'https://api.github.com/repos/acme/widgets/issues/7',
+      html_url: `https://github.com/acme/widgets/issues/7#issuecomment-${id}` })
+    const signed = `Done\n\nby 大肥鱼\n\n${agentMarker('r1')}`
+    repository(h, { comments: [comment(1, '可以做', 'agent-bot'), comment(2, signed, 'agent-bot'),
+      comment(3, signed, 'carol'), comment(4, '另一条', 'carol')] })
+    await pollRound(h)
+    expect(h.receive.mock.calls.map(([trigger]) => [trigger.meta.number, trigger.meta.kind, trigger.human, trigger.text]))
+      .toEqual([[7, 'conversation', true, '可以做'], [7, 'conversation', true, '另一条']])
+    h.store.close()
+  })
+  it('drops every comment from the agent account when sharedAccount is off', async () => {
+    const h = host()
+    observe(h, { observeComments: true })
+    h.store.set('github-since', at(-24))
+    for (const stream of ['comments', 'review-comments']) {
+      h.store.set(`github-stream:${stream}`, { since: at(0), started: { comments: at(0) } })
+    }
+    const comment = (id: number, body: string, user: string) => ({ id, body, user: { login: user, type: 'User' },
+      created_at: at(1), updated_at: at(1), issue_url: 'https://api.github.com/repos/acme/widgets/issues/7',
+      html_url: `https://github.com/acme/widgets/issues/7#issuecomment-${id}` })
+    repository(h, { comments: [comment(1, '可以做', 'agent-bot'), comment(2, '另一条', 'carol')] })
+    await pollRound(h)
+    expect(h.receive.mock.calls.map(([trigger]) => [trigger.human, trigger.text])).toEqual([[true, '另一条']])
     h.store.close()
   })
   it('fails the round for a stream whose read fails, keeps its cursor, and still reads the other streams', async () => {

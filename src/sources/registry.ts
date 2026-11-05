@@ -95,7 +95,9 @@ export class SourceRegistry implements SourceScope {
   async send(message: OutboundMessage, commands: Commands): Promise<'sent' | 'gone' | 'waiting'> {
     const kind = this.kinds.get(message.channel.source)
     if (!kind) return 'waiting'
-    return kind.channel ? kind.channel.send({ commands }, message) : 'gone'
+    // A channel reads the Source's current configuration, such as the GitHub reply signature.
+    const instance = this.resolve(kind, this.settings().sources[message.channel.source])
+    return kind.channel ? kind.channel.send({ commands, config: instance.config }, message) : 'gone'
   }
   link(channel: ChannelRef, links: ChannelLinks): ChannelLink {
     const link = this.kinds.get(channel.source)?.channel?.link(channel.address, links)

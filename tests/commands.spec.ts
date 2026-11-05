@@ -43,9 +43,19 @@ describe('account-isolated operations', () => {
     const gh = vi.spyOn(commands,'gh').mockResolvedValue({})
     await send(commands, reply)
     // The disclosure line is prompt text: the model writes it, and the host adds nothing.
-    expect(gh).toHaveBeenCalledWith(['api',`repos/${REPOSITORY}/issues/8/comments`,'--method','POST','-f',expect.stringMatching(/^body=Done\n\n<!-- dsh-superagent:stable-operation -->$/)])
+    expect(gh).toHaveBeenCalledWith(['api',`repos/${REPOSITORY}/issues/8/comments`,'--method','POST','-f',expect.stringMatching(/^body=Done\n\nby 大肥鱼\n\n<!-- dsh-superagent:stable-operation -->$/)])
     await expect(new Commands(() => deployment, {}, new AbortController().signal).pages(z.unknown(),
       '../../someone/else/issues')).rejects.toThrow()
+  })
+  it('signs every agent reply with the signature configured on the GitHub Source', async () => {
+    const custom = new SourceRegistry(() => SettingsSchema.parse({ sources: { github: { enabled: true, config: { agentSignature: 'by 小肥鱼' } } } }))
+    custom.register(githubKind)
+    const commands = new Commands(() => deployment, {}, new AbortController().signal)
+    vi.spyOn(commands, 'pages').mockResolvedValue([])
+    const gh = vi.spyOn(commands, 'gh').mockResolvedValue({})
+    await custom.send(reply, commands)
+    expect(gh).toHaveBeenCalledWith(['api', `repos/${REPOSITORY}/issues/8/comments`, '--method', 'POST', '-f',
+      expect.stringMatching(/^body=Done\n\nby 小肥鱼\n\n<!-- dsh-superagent:stable-operation -->$/)])
   })
   it('routes review-comment replies to the root review comment', async () => {
     const commands = new Commands(() => deployment, {}, new AbortController().signal); vi.spyOn(commands,'pages').mockResolvedValue([])
